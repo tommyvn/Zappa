@@ -111,7 +111,7 @@ class LambdaHandler(object):
                 # as an error to match our APIGW regex.
                 # The DOCTYPE ensures that the page still renders in the browser.
                 exception = None
-                if response.status_code in [400, 401, 403, 404, 500]:
+                if response.status_code in [400, 401, 403, 404, 500, 503]:
                     content = "<!DOCTYPE html>" + str(response.status_code) + response.data
                     exception = base64.b64encode(content)
                 # Internal are changed to become relative redirects
