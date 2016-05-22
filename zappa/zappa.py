@@ -34,6 +34,9 @@ TEMPLATE_MAPPING = """{
     #end
   },
   "method": "$context.httpMethod",
+  "context": {
+    "identity": "$context.identity.userArn"
+  },
   "params": {
     #foreach($param in $input.params().path.keySet())
     "$param": "$util.escapeJavaScript($input.params().path.get($param))" #if($foreach.hasNext),#end
@@ -58,6 +61,9 @@ POST_TEMPLATE_MAPPING = """#set($rawPostData = $input.path('$'))
     #end
   },
   "method": "$context.httpMethod",
+  "context": {
+    "identity": "$context.identity.userArn"
+  },
   "params": {
     #foreach($param in $input.params().path.keySet())
     "$param": "$util.escapeJavaScript($input.params().path.get($param))" #if($foreach.hasNext),#end
@@ -82,6 +88,9 @@ FORM_ENCODED_TEMPLATE_MAPPING = """
     #end
   },
   "method": "$context.httpMethod",
+  "context": {
+    "identity": "$context.identity.userArn"
+  },
   "params": {
     #foreach($param in $input.params().path.keySet())
     "$param": "$util.escapeJavaScript($input.params().path.get($param))" #if($foreach.hasNext),#end
@@ -221,6 +230,8 @@ class Zappa(object):
 
     boto_session = None
     credentials_arn = None
+
+    authorization_type = 'none'
 
     def __init__(self, boto_session=None, profile_name=None):
         self.load_credentials(boto_session, profile_name)
@@ -616,7 +627,7 @@ class Zappa(object):
                     restApiId=api_id,
                     resourceId=resource_id,
                     httpMethod=method,
-                    authorizationType='none',
+                    authorizationType=self.authorization_type,
                     apiKeyRequired=False
             )
             report_progress()

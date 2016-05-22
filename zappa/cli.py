@@ -35,6 +35,7 @@ CUSTOM_SETTINGS = [
     'parameter_depth',
     'role_name',
     'touch',
+    'authorization_type',
 ]
 
 ##
@@ -323,6 +324,8 @@ class ZappaCLI(object):
             self.api_stage].get('prebuild_script', None)
         self.profile_name = self.zappa_settings[
             self.api_stage].get('profile_name', None)
+        self.profile_name = self.zappa_settings[
+            self.api_stage].get('authorization_type', 'none')
 
         # Create an Zappa object..
         self.zappa = Zappa(session)
