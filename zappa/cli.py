@@ -324,7 +324,7 @@ class ZappaCLI(object):
             self.api_stage].get('prebuild_script', None)
         self.profile_name = self.zappa_settings[
             self.api_stage].get('profile_name', None)
-        self.profile_name = self.zappa_settings[
+        self.authorization_type = self.zappa_settings[
             self.api_stage].get('authorization_type', 'none')
 
         # Create an Zappa object..
