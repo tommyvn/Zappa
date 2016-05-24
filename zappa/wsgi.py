@@ -18,6 +18,7 @@ def create_wsgi_request(event_info, server_name='zappa', script_name=None,
         params = event_info['params']
         query = event_info['query']
         headers = event_info['headers']
+        context = event_info['context']
 
         # Make header names canonical, e.g. content-type => Content-Type
         for header in headers.keys():
@@ -72,6 +73,7 @@ def create_wsgi_request(event_info, server_name='zappa', script_name=None,
             'wsgi.multiprocess': False,
             'wsgi.multithread': False,
             'wsgi.run_once': False,
+            'lambda.context': context,
         }
 
         # Input processing
