@@ -2,12 +2,16 @@ import base64
 import boto3
 import botocore
 import fnmatch
+import imp
 import json
 import logging
 import os
 import pip
+import random
 import requests
 import shutil
+import string
+import sys
 import tarfile
 import tempfile
 import time
@@ -26,7 +30,7 @@ logger = logging.getLogger(__name__)
 ##
 
 TEMPLATE_MAPPING = """{
-  "body" : $input.json('$'),
+  "body" : "$util.base64Encode($input.json("$"))",
   "headers": {
     #foreach($header in $input.params().header.keySet())
     "$header": "$util.escapeJavaScript($input.params().header.get($header))" #if($foreach.hasNext),#end
@@ -51,9 +55,9 @@ TEMPLATE_MAPPING = """{
   }
 }"""
 
-POST_TEMPLATE_MAPPING = """#set($rawPostData = $input.path('$'))
+POST_TEMPLATE_MAPPING = """#set($rawPostData = $input.path("$"))
 {
-  "body" : "$rawPostData",
+  "body" : "$util.base64Encode($input.body)",
   "headers": {
     #foreach($header in $input.params().header.keySet())
     "$header": "$util.escapeJavaScript($input.params().header.get($header))" #if($foreach.hasNext),#end
@@ -113,8 +117,9 @@ ASSUME_POLICY = """{
       "Effect": "Allow",
       "Principal": {
         "Service": [
+          "apigateway.amazonaws.com",
           "lambda.amazonaws.com",
-          "apigateway.amazonaws.com"
+          "events.amazonaws.com"
         ]
       },
       "Action": "sts:AssumeRole"
@@ -205,11 +210,11 @@ class Zappa(object):
         'POST'
     ]
     parameter_depth = 8
-    integration_response_codes = [200, 301, 400, 401, 403, 404, 500]
+    integration_response_codes = [200, 201, 301, 400, 401, 403, 404, 500]
     integration_content_types = [
         'text/html',
     ]
-    method_response_codes = [200, 301, 400, 401, 403, 404, 500]
+    method_response_codes = [200, 201, 301, 400, 401, 403, 404, 500]
     method_content_types = [
         'text/html',
     ]
@@ -241,7 +246,7 @@ class Zappa(object):
     ##
 
     def create_lambda_zip(self, prefix='lambda_package', handler_file=None,
-                          minify=True, exclude=None, use_precompiled_packages=True, include=None):
+                          minify=True, exclude=None, use_precompiled_packages=True, include=None, venv=None):
         """
         Creates a Lambda-ready zip file of the current virtualenvironment and working directory.
 
@@ -250,7 +255,12 @@ class Zappa(object):
         """
         print("Packaging project as zip...")
 
-        venv = os.environ['VIRTUAL_ENV']
+        if not venv:
+            try:
+                venv = os.environ['VIRTUAL_ENV']
+            except KeyError as e: # pragma: no cover
+                print("Zappa requires an active virtual environment.")
+                quit()
 
         cwd = os.getcwd()
         zip_fname = prefix + '-' + str(int(time.time())) + '.zip'
@@ -327,7 +337,7 @@ class Zappa(object):
         try:
             import zlib
             compression_method = zipfile.ZIP_DEFLATED
-        except Exception as e: # pragma: no cover
+        except ImportError as e: # pragma: no cover
             compression_method = zipfile.ZIP_STORED
 
         zipf = zipfile.ZipFile(zip_path, 'w', compression_method)
@@ -336,10 +346,19 @@ class Zappa(object):
 
                 # If there is a .pyc file in this package,
                 # we can skip the python source code as we'll just
-                # use the compiled bytecode anyway.
+                # use the compiled bytecode anyway..
                 if filename[-3:] == '.py':
-                    if os.path.isfile(os.path.join(root, filename) + 'c'):
-                        continue
+                    abs_filname = os.path.join(root, filename)
+                    abs_pyc_filename = abs_filname + 'c'
+                    if os.path.isfile(abs_pyc_filename):
+
+                        # but only if the pyc is older than the py,
+                        # otherwise we'll deploy outdated code!
+                        py_time = os.stat(abs_filname).st_mtime
+                        pyc_time = os.stat(abs_pyc_filename).st_mtime
+
+                        if pyc_time > py_time:
+                            continue
 
                 zipf.write(os.path.join(root, filename), os.path.join(root.replace(temp_project_path, ''), filename))
 
@@ -356,6 +375,7 @@ class Zappa(object):
             print("\n\nWarning: Application zip package is likely to be too large for AWS Lambda.\n\n")
 
         return zip_fname
+
     ##
     # S3
     ##
@@ -374,8 +394,8 @@ class Zappa(object):
         # Will likely fail, but that's apparently the best way to check
         # it exists, since boto3 doesn't expose a better check.
         try:
-            s3.create_bucket(Bucket=bucket_name)
-        except Exception as e: # pragma: no cover
+            s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={"LocationConstraint": self.aws_region})
+        except botocore.exceptions.ClientError as e: # pragma: no cover
             pass
 
         if not os.path.isfile(source_path) or os.stat(source_path).st_size == 0:
@@ -397,7 +417,7 @@ class Zappa(object):
                     source_path, bucket_name, dest_path,
                     Callback=progress.update
                 )
-            except Exception as e: # pragma: no cover                
+            except Exception as e: # pragma: no cover
                 s3 = self.boto_session.client('s3')
                 s3.upload_file(source_path, bucket_name, dest_path)
 
@@ -470,6 +490,8 @@ class Zappa(object):
         Given a bucket and key of a valid Lambda-zip, a function name and a handler, update that Lambda function's code.
 
         """
+
+        print("Updating Lambda function..")
 
         client = self.boto_session.client('lambda')
         response = client.update_function_code(
@@ -636,7 +658,7 @@ class Zappa(object):
             post_template_mapping = POST_TEMPLATE_MAPPING
             form_encoded_template_mapping = FORM_ENCODED_TEMPLATE_MAPPING
             content_mapping_templates = {
-                'application/json': template_mapping,
+                'application/json': post_template_mapping,
                 'application/x-www-form-urlencoded': post_template_mapping,
                 'multipart/form-data': form_encoded_template_mapping
             }
@@ -757,8 +779,6 @@ class Zappa(object):
         """
         Delete a deployed REST API Gateway.
 
-        Returns
-
         """
 
         print("Deleting API Gateway..")
@@ -809,10 +829,11 @@ class Zappa(object):
         attach_policy_s = ATTACH_POLICY
 
         attach_policy_obj = json.loads(attach_policy_s)
+        assume_policy_obj = json.loads(assume_policy_s)
 
         iam = self.boto_session.resource('iam')
 
-        # create the role if needed
+        # Create the role if needed
         role = iam.Role(self.role_name)
         try:
             self.credentials_arn = role.arn
@@ -824,7 +845,7 @@ class Zappa(object):
                                    AssumeRolePolicyDocument=assume_policy_s)
             self.credentials_arn = role.arn
 
-        # create or update the role's policy if needed
+        # create or update the role's policies if needed
         policy = iam.RolePolicy(self.role_name, 'zappa-permissions')
         try:
             if policy.policy_document != attach_policy_obj:
@@ -835,7 +856,211 @@ class Zappa(object):
             print("Creating zappa-permissions policy on " + self.role_name + " IAM Role.")
             policy.put(PolicyDocument=attach_policy_s)
 
+        if role.assume_role_policy_document != assume_policy_obj and \
+                set(role.assume_role_policy_document['Statement'][0]['Principal']['Service']) != set(assume_policy_obj['Statement'][0]['Principal']['Service']):
+            print("Updating assume role policy on " + self.role_name + " IAM Role.")
+            client = self.boto_session.client('iam')
+            client.update_assume_role_policy(
+                RoleName=self.role_name,
+                PolicyDocument=assume_policy_s
+            )
+
         return self.credentials_arn
+
+    ##
+    # CloudWatch Events
+    ##
+
+    def schedule_events(self, lambda_arn, lambda_name, events):
+        """
+        Given a Lambda ARN, name and a list of events, schedule this as CloudWatch Events.
+
+        'events' is a list of dictionaries, where the dict must contains the string
+        of a 'function' and the string of the event 'expression', and an optional 'name' and 'description'.
+
+        Expressions can be in rate or cron format:
+            http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html
+
+        """
+
+        client = self.boto_session.client('events')
+        lambda_client = self.boto_session.client('lambda')
+
+        for event in events:
+
+            function = event['function']
+            expression = event['expression']
+            name = event.get('name', function)
+            description = event.get('description', function)
+
+            self.delete_rule(name)
+
+            #   - If 'cron' or 'rate' in expression, use ScheduleExpression
+            #   - Else, use EventPattern
+            #       - ex https://github.com/awslabs/aws-lambda-ddns-function
+
+            if 'cron' in expression or 'rate' in expression:
+                response = client.put_rule(
+                    Name=name,
+                    ScheduleExpression=expression,
+                    State='ENABLED',
+                    Description=description,
+                    RoleArn=self.credentials_arn
+                )
+            else:
+                response = client.put_rule(
+                    Name=name,
+                    EventPattern=expression,
+                    State='ENABLED',
+                    Description=description,
+                    RoleArn=self.credentials_arn
+                )
+
+            response = lambda_client.add_permission(
+                FunctionName=lambda_name,
+                StatementId=''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
+                Action='lambda:InvokeFunction',
+                Principal='events.amazonaws.com',
+                SourceArn=response['RuleArn'],
+            )
+
+            # Create the CloudWatch event ARN for this function.
+            target_arn = lambda_arn
+            inp = json.dumps({'detail': function})
+            target_response = client.put_targets(
+                Rule=name,
+                Targets=[
+                    {
+                        'Id': function,
+                        'Arn': target_arn,
+                        'Input': inp,
+                    },
+                ]
+            )
+
+            print("Scheduled " + name + " at " + expression + ".")
+
+        return
+
+    def delete_rule(self, rule_name):
+        """
+        Delete a CWE rule.
+
+        """
+
+        client = self.boto_session.client('events')
+
+        # All targets must be removed before
+        # we can actually delete the rule.
+        try:
+            targets = client.list_targets_by_rule(
+                Rule=rule_name,
+            )['Targets']
+        except botocore.exceptions.ClientError as e:
+            # Likely no target by this rule, nothing to delete.
+            return
+
+        if targets == []:
+            return
+
+        for target in targets:
+            response = client.remove_targets(
+                Rule=rule_name,
+                Ids=[
+                    target['Id'],
+                ]
+            )
+
+        # Delete our rules.
+        rules = client.list_rules(
+            NamePrefix=rule_name,
+        )['Rules']
+        for rule in rules:
+            if rule['Name'] == rule_name:
+
+               response = client.delete_rule(
+                    Name=rule_name
+                )
+
+        return
+
+    def unschedule_events(self, lambda_arn, lambda_name, events):
+        """
+        Given a list of events, unschedule these CloudWatch Events.
+
+        'events' is a list of dictionaries, where the dict must contains the string
+        of a 'function' and the string of the event 'expression', and an optional 'name' and 'description'.
+
+        """
+
+        client = self.boto_session.client('events')
+
+        for event in events:
+            function = event['function']
+            name = event.get('name', function)
+            self.delete_rule(name)
+
+            print("Uncheduled " + name + ".")
+
+        return
+
+    def create_keep_warm(self, lambda_arn, lambda_name, name="zappa-keep-warm", schedule_expression="rate(5 minutes)"):
+        """
+        Schedule a regularly occuring execution to keep the function warm in cache.
+
+        """
+
+        client = self.boto_session.client('events')
+        lambda_client = self.boto_session.client('lambda')
+        rule_name = name + "-" + str(lambda_name)
+
+        print("Scheduling keep-warm..")
+
+        # Do we have an old keepwarm for this?
+        self.delete_rule(rule_name)
+
+        response = client.put_rule(
+            Name=rule_name,
+            ScheduleExpression=schedule_expression,
+            State='ENABLED',
+            Description='Zappa Keep Warm - ' + str(lambda_name),
+            RoleArn=self.credentials_arn
+        )
+
+        response = lambda_client.add_permission(
+            FunctionName=lambda_name,
+            StatementId=''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
+            Action='lambda:InvokeFunction',
+            Principal='events.amazonaws.com',
+            SourceArn=response['RuleArn'],
+        )
+
+        target_arn = lambda_arn
+        response = client.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    'Id': str(sum([ ord(c) for c in lambda_arn])), # Is this insane?
+                    'Arn': target_arn,
+                    'Input': '',
+                },
+            ]
+        )
+
+    def remove_keep_warm(self, lambda_name, name="zappa-keep-warm"):
+        """
+        Unschedule the regularly occuring execution to keep the function warm in cache.
+
+        """
+
+        client = self.boto_session.client('events')
+        lambda_client = self.boto_session.client('lambda')
+        rule_name = name + "-" + str(lambda_name)
+
+        print("Removing keep-warm..")
+
+        self.delete_rule(rule_name)
+
 
     ##
     # CloudWatch Logging
@@ -888,6 +1113,12 @@ class Zappa(object):
             # If provided, use the supplied profile name.
             if profile_name:
                 self.boto_session = boto3.Session(profile_name=profile_name, region_name=self.aws_region)
+            elif os.environ.get('AWS_ACCESS_KEY_ID') and os.environ.get('AWS_SECRET_ACCESS_KEY'):
+                region_name = os.environ.get('AWS_DEFAULT_REGION') or self.aws_region
+                self.boto_session = boto3.Session(
+                    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+                    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+                    region_name=region_name)
             else:
                 self.boto_session = boto3.Session(region_name=self.aws_region)
 

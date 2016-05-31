@@ -20,20 +20,18 @@ def create_wsgi_request(event_info, server_name='zappa', script_name=None,
         headers = event_info['headers']
         context = event_info['context']
 
+        # Non-GET data is B64'd through the APIGW.
+        if method in ["POST", "PUT", "PATCH"]:
+            encoded_body = event_info['body']
+            body = base64.b64decode(encoded_body)
+        else:
+            body = event_info['body']
+
         # Make header names canonical, e.g. content-type => Content-Type
         for header in headers.keys():
             canonical = header.title()
             if canonical != header:
                 headers[canonical] = headers.pop(header)
-
-        content_type = headers.get('Content-Type', '')
-        # Some clients implement a non-rfc compliant content-type string:
-        # e.g. "application/json; charset=utf-8"
-        content_type = content_type.lower().split(';')[0]
-        if content_type == 'application/json':
-            body = str(json.dumps(event_info['body']))
-        else:
-            body = str(event_info['body'])
 
         path = "/"
         for key in sorted(params.keys()):
@@ -62,7 +60,7 @@ def create_wsgi_request(event_info, server_name='zappa', script_name=None,
             'QUERY_STRING': query_string,
             'REMOTE_ADDR': remote_addr,
             'REQUEST_METHOD': method,
-            'SCRIPT_NAME': str(''),
+            'SCRIPT_NAME': str(script_name) if script_name else '',
             'SERVER_NAME': str(server_name),
             'SERVER_PORT': str('80'),
             'SERVER_PROTOCOL': str('HTTP/1.1'),
@@ -78,24 +76,32 @@ def create_wsgi_request(event_info, server_name='zappa', script_name=None,
 
         # Input processing
         if method in ["POST", "PUT", "PATCH"]:
-            if 'Content-Type' in event_info["headers"]:
-                environ['CONTENT_TYPE'] = event_info["headers"]['Content-Type']
+            if 'Content-Type' in headers:
+                environ['CONTENT_TYPE'] = headers['Content-Type']
 
-                # Multipart forms are Base64 encoded through API Gateway
-                if 'multipart/form-data;' in event_info["headers"]['Content-Type']:
-                    body = base64.b64decode(body)
+                # B64'ing everything now until this is resolved.
+                #
+                # # Multipart forms are Base64 encoded through API Gateway
+                # if 'multipart/form-data;' in headers['Content-Type']:
+                #
+                #     # Unfortunately, this only works for text data,
+                #     # not binary data. Yet. 
+                #     # See: 
+                #     #   https://github.com/Miserlou/Zappa/issues/80
+                #     #   https://forums.aws.amazon.com/thread.jspa?threadID=231371&tstart=0
+                #     body = base64.b64decode(body)
 
             environ['wsgi.input'] = StringIO(body)
-
             environ['CONTENT_LENGTH'] = str(len(body))
 
-        for header in event_info["headers"]:
+        for header in headers:
             wsgi_name = "HTTP_" + header.upper().replace('-', '_')
-            environ[wsgi_name] = str(event_info["headers"][header])
+            environ[wsgi_name] = str(headers[header])
 
         if script_name:
             environ['SCRIPT_NAME'] = script_name
             path_info = environ['PATH_INFO']
+
             if script_name in path_info:
                 environ['PATH_INFO'].replace(script_name, '')
 

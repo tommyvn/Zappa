@@ -7,7 +7,6 @@
 [![Build Status](https://travis-ci.org/Miserlou/Zappa.svg)](https://travis-ci.org/Miserlou/Zappa)
 [![Coverage](https://img.shields.io/coveralls/Miserlou/Zappa.svg)](https://coveralls.io/github/Miserlou/Zappa)
 [![Requirements Status](https://requires.io/github/Miserlou/Zappa/requirements.svg?branch=master)](https://requires.io/github/Miserlou/Zappa/requirements/?branch=master) 
-[![PyPI](https://img.shields.io/pypi/dm/Zappa.svg?style=flat)](https://pypi.python.org/pypi/zappa/)
 [![PyPI](https://img.shields.io/pypi/v/Zappa.svg)](https://pypi.python.org/pypi/zappa)
 [![Slack](https://img.shields.io/badge/chat-slack-ff69b4.svg)](https://slackautoinviter.herokuapp.com/)
 
@@ -79,7 +78,7 @@ Once your settings are configured, you can package and deploy your application t
 
 And now your app is **live!** How cool is that?!
 
-To expain what's going on, when you call 'deploy', Zappa will automatically package up your application and local virtual environment into a Lambda-compatible archive, replace any dependencies with versions [precompiled for Lambda](https://github.com/Miserlou/lambda-packages), set up the function handler and necessary WSGI Middleware, upload the archive to S3, register it as a new Lambda function, create a new API Gateway resource, create WSGI-compatible routes for it, link it to the new Lambda function, and finally delete the archive from your S3 bucket. Handy!
+To explain what's going on, when you call 'deploy', Zappa will automatically package up your application and local virtual environment into a Lambda-compatible archive, replace any dependencies with versions [precompiled for Lambda](https://github.com/Miserlou/lambda-packages), set up the function handler and necessary WSGI Middleware, upload the archive to S3, register it as a new Lambda function, create a new API Gateway resource, create WSGI-compatible routes for it, link it to the new Lambda function, and finally delete the archive from your S3 bucket. Handy!
 
 #### Updates
 
@@ -96,6 +95,34 @@ This creates a new archive, uploads it to S3 and updates the Lambda function to 
 You can also rollback the deployed code to a previous version by supplying the number of revisions to return to. For instance, to rollback to the version deployed 3 versions ago:
 
     $ zappa rollback production -n 3
+
+#### Scheduling
+
+Zappa can be used to easily schedule functions to occur on regular intervals. Just list your functions and the expression to schedule them using [cron or rate syntax](http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html) in your *zappa_settings.json* file:
+
+```javascript
+     {
+        "production": {
+            ...
+            "events": [{
+                "function": "your_module.your_function", // The function to execute
+                "expression": "rate(1 minute)" // When to execute it (in cron or rate format)
+            }],
+            ...
+    }
+```
+
+And then:
+
+    $ zappa schedule production
+
+And now your function will execute every minute!
+
+If you want to cancel these, you can simply use the 'unschedule' command:
+
+    $ zappa unschedule production
+
+And now your scheduled event rules are deleted.
 
 #### Undeploy
 
@@ -122,10 +149,16 @@ to change Zappa's behavior. Use these at your own risk!
         "aws_region": "us-east-1", // AWS Region (default US East),
         "debug": true // Print Zappa configuration errors tracebacks in the 500
         "delete_zip": true // Delete the local zip archive after code updates
+        "events": [{
+            "function": "your_module.your_function", // The function to execute
+            "expression": "rate(1 minute)" // When to execute it (in cron or rate format)
+        }],
         "domain": "yourapp.yourdomain.com", // Required if you're using a domain
         "exclude": ["*.gz", "*.pem"], // A list of regex patterns to exclude from the archive
         "http_methods": ["GET", "POST"], // HTTP Methods to route,
         "integration_response_codes": [200, 301, 404, 500], // Integration response status codes to route
+        "keep_warm": true, // Create CloudWatch events to keep the server warm.
+        "log_level": "DEBUG", // Set the Zappa log level. Default DEBUG, can be one of CRITICAL, ERROR, WARNING, INFO and DEBUG. 
         "memory_size": 512, // Lambda function memory in MB
         "method_response_codes": [200, 301, 404, 500], // Method response status codes to route
         "parameter_depth": 10, // Size of URL depth to route. Defaults to 8.
@@ -144,13 +177,13 @@ to change Zappa's behavior. Use these at your own risk!
 }
 ```
 
-#### Keeping the server warm
+#### Keeping The Server Warm
 
-Lambda has a limitation that functions which aren't called very often take longer to start - sometimes up to ten seconds. However, functions that are called regularly are cached and start quickly, usually in less than 50ms. To ensure that your servers are kept in a cached state, you can [manually configure](http://stackoverflow.com/a/27382253) a scheduled task for your Zappa function that'll keep the server cached by calling it every 5 minutes. There is currently no way to configure this through API, so you'll have to set this up manually. When this ability is available via API, Zappa will configure this automatically. It would be nice to also add support LetsEncrypt through this same mechanism.
+Zappa will automatically set up a regularly occuring execution of your application in order to keep the Lambda function warm. This can be disabled via the 'keep_warm' setting.
 
 #### Enabling CORS
 
-To enable Cross-Origin Resource Sharing (CORS) for your application, follow the [AWS "How to CORS" Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html) to enable CORS via the API Gateway Console. Don't forget to re-deploy your API after making the changes!
+To enable Cross-Origin Resource Sharing (CORS) for your application, follow the [AWS "How to CORS" Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html) to enable CORS via the API Gateway Console. Don't forget to enable CORS per parameter and re-deploy your API after making the changes!
 
 #### Deploying to a Domain With a Let's Encrypt Certificate
 

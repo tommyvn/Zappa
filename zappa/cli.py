@@ -12,7 +12,7 @@ from __future__ import unicode_literals
 import argparse
 import datetime
 import inspect
-import importlib
+import imp
 import hjson as json
 import os
 import re
@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unicodedata
 import zipfile
+import pkg_resources
 
 from zappa import Zappa
 
@@ -55,6 +56,7 @@ class ZappaCLI(object):
     prebuild_script = None
     project_name = None
     profile_name = None
+    lambda_arn = None
     lambda_name = None
     s3_bucket_name = None
     settings_file = None
@@ -79,20 +81,36 @@ class ZappaCLI(object):
                             help='The path to a zappa settings file.')
         parser.add_argument('-a', '--app_function', type=str, default=None,
                             help='The WSGI application function.')
+        parser.add_argument('-v', '--version', action='store_true', help='Print the zappa version', default=False)
 
         args = parser.parse_args(argv)
         vargs = vars(args)
-        if not any(vargs.values()): # pragma: no cover
+        vargs_nosettings = vargs.copy()
+        vargs_nosettings.pop('settings_file')
+        if not any(vargs_nosettings.values()): # pragma: no cover
             parser.error("Please supply a command to execute. Can be one of 'deploy', 'update', 'tail', rollback', 'invoke'.'")
             return
 
+        # version requires no arguments
+        if args.version:
+            self.print_version()
+            sys.exit(0)
+
         # Parse the input
         command_env = vargs['command_env']
-        if len(command_env) < 2: # pragma: no cover
-            parser.error("Please supply an environment to interact with.")
-            return
         command = command_env[0]
-        self.api_stage = command_env[1]
+        if len(command_env) < 2: # pragma: no cover
+            self.load_settings_file(vargs['settings_file'])
+
+            # If there's only one environment defined in the settings,
+            # use that as the default.
+            if len(self.zappa_settings.keys()) is 1:
+                self.api_stage = self.zappa_settings.keys()[0]
+            else:
+                parser.error("Please supply an environment to interact with.")
+                return
+        else:
+            self.api_stage = command_env[1]
 
         # Load our settings
         self.load_settings(vargs['settings_file'])
@@ -115,6 +133,10 @@ class ZappaCLI(object):
             self.tail()
         elif command == 'undeploy': # pragma: no cover
             self.undeploy()
+        elif command == 'schedule': # pragma: no cover
+            self.schedule()
+        elif command == 'unschedule': # pragma: no cover
+            self.unschedule()
         else:
             print("The command '%s' is not recognized." % command)
             return
@@ -149,16 +171,20 @@ class ZappaCLI(object):
 
         # Register the Lambda function with that zip as the source
         # You'll also need to define the path to your lambda_handler code.
-        lambda_arn = self.zappa.create_lambda_function(bucket=self.s3_bucket_name,
+        self.lambda_arn = self.zappa.create_lambda_function(bucket=self.s3_bucket_name,
                                                        s3_key=self.zip_path,
                                                        function_name=self.lambda_name,
                                                        handler='handler.lambda_handler',
                                                        vpc_config=self.vpc_config,
                                                        memory_size=self.memory_size)
 
+        # Create a Keep Warm for this deployment
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.create_keep_warm(self.lambda_arn, self.lambda_name)
+
         # Create and configure the API Gateway
         api_id = self.zappa.create_api_gateway_routes(
-            lambda_arn, self.lambda_name)
+            self.lambda_arn, self.lambda_name)
 
         # Deploy the API!
         endpoint_url = self.zappa.deploy_api_gateway(api_id, self.api_stage)
@@ -186,6 +212,9 @@ class ZappaCLI(object):
         if self.prebuild_script:
             self.execute_prebuild_script()
 
+        # Make sure the necessary IAM execution roles are available
+        self.zappa.create_iam_roles()
+
         # Create the Lambda Zip,
         self.create_package()
 
@@ -197,8 +226,12 @@ class ZappaCLI(object):
 
         # Register the Lambda function with that zip as the source
         # You'll also need to define the path to your lambda_handler code.
-        lambda_arn = self.zappa.update_lambda_function(
+        self.lambda_arn = self.zappa.update_lambda_function(
             self.s3_bucket_name, self.zip_path, self.lambda_name)
+
+        # Create a Keep Warm for this deployment
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.create_keep_warm(self.lambda_arn, self.lambda_name)
 
         # Remove the uploaded zip from S3, because it is now registered..
         self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
@@ -254,17 +287,73 @@ class ZappaCLI(object):
 
 
     def undeploy(self):
+        """
+        Tear down an exiting deployment.
+        """
 
         confirm = raw_input("Are you sure you want to undeploy? [y/n] ")
         if confirm != 'y':
             return
 
         self.zappa.undeploy_api_gateway(self.lambda_name)
+        if self.zappa_settings[self.api_stage].get('keep_warm', True):
+            self.zappa.remove_keep_warm(self.lambda_name)
         self.zappa.delete_lambda_function(self.lambda_name)
 
         print("Done!")
 
         return
+
+    def schedule(self):
+        """
+        Given a a list of functions and a schedule to execute them,
+        setup up regular execution.
+
+        """
+
+        if self.zappa_settings[self.api_stage].get('events', None):
+            events = self.zappa_settings[self.api_stage]['events']
+
+            if type(events) != type([]):
+                print("Events must be supplied as a list.")
+                return
+
+            # Update, as we need to get the Lambda ARN.
+            # There is probably a better way to do this.
+            # XXX
+            # http://boto3.readthedocs.io/en/latest/reference/services/lambda.html#Lambda.Client.get_function
+            self.update()
+
+            print("Scheduling..")
+            self.zappa.schedule_events(self.lambda_arn, self.lambda_name, events)
+
+        return
+
+    def unschedule(self):
+        """
+        Given a a list of scheduled functions,
+        tear down their regular execution.
+
+        """
+
+        if self.zappa_settings[self.api_stage].get('events', None):
+            events = self.zappa_settings[self.api_stage]['events']
+
+            if type(events) != type([]):
+                print("Events must be supplied as a list.")
+                return
+
+            print("Unscheduling..")
+            self.zappa.unschedule_events(events)
+
+        return
+
+    def print_version(self):
+        """
+        Print the current zappa version.
+        """
+        version = pkg_resources.require("zappa")[0].version
+        print(version)
 
     ##
     # Utility
@@ -285,13 +374,7 @@ class ZappaCLI(object):
             quit() # pragma: no cover
 
         # Load up file
-        try:
-            with open(settings_file) as json_file:
-                self.zappa_settings = json.load(json_file)
-        except Exception as e: # pragma: no cover
-            print("Problem parsing settings file.")
-            print(e)
-            quit() # pragma: no cover
+        self.load_settings_file(settings_file)
 
         # Make sure that this environment is our settings
         if self.api_stage not in self.zappa_settings.keys():
@@ -326,6 +409,10 @@ class ZappaCLI(object):
             self.api_stage].get('profile_name', None)
         self.authorization_type = self.zappa_settings[
             self.api_stage].get('authorization_type', 'none')
+        self.log_level = self.zappa_settings[
+            self.api_stage].get('log_level', "DEBUG")
+        self.domain = self.zappa_settings[
+            self.api_stage].get('domain', None)
 
         # Create an Zappa object..
         self.zappa = Zappa(session)
@@ -343,6 +430,15 @@ class ZappaCLI(object):
                         self.api_stage][setting])        
 
         return self.zappa
+
+    def load_settings_file(self, settings_file="zappa_settings.json"):
+        try:
+            with open(settings_file) as json_file:
+                self.zappa_settings = json.load(json_file)
+        except Exception as e: # pragma: no cover
+            print("Problem parsing settings file.")
+            print(e)
+            quit() # pragma: no cover
 
     def create_package(self):
         """
@@ -362,8 +458,8 @@ class ZappaCLI(object):
         self.zip_path = self.zappa.create_lambda_zip(
                 self.lambda_name,
                 handler_file=handler_file,
-                use_precompiled_packages=self.zappa_settings.get('use_precompiled_packages', True),
-                exclude=self.zappa_settings.get('exclude', [])
+                use_precompiled_packages=self.zappa_settings[self.api_stage].get('use_precompiled_packages', True),
+                exclude=self.zappa_settings[self.api_stage].get('exclude', [])
             )
 
         # Throw our setings into it
@@ -372,7 +468,18 @@ class ZappaCLI(object):
             settings_s = "# Generated by Zappa\nAPP_MODULE='%s'\nAPP_FUNCTION='%s'\n" % (app_module, app_function)
             
             if self.debug is not None:
-                settings_s = settings_s + "DEBUG='%s'" % (self.debug) # Cast to Bool in handler
+                settings_s = settings_s + "DEBUG='%s'\n" % (self.debug) # Cast to Bool in handler
+            settings_s = settings_s + "LOG_LEVEL='%s'\n" % (self.log_level)
+
+            # If we're on a domain, we don't need to define the /<<env>> in
+            # the WSGI PATH
+            if self.domain:
+                settings_s = settings_s + "DOMAIN='%s'\n" % (self.domain)
+            else:
+                settings_s = settings_s + "DOMAIN=None\n"
+
+            # We can be environment-aware
+            settings_s = settings_s + "API_STAGE='%s'\n" % (self.api_stage)
 
             # Lambda requires a specific chmod
             temp_settings = tempfile.NamedTemporaryFile(delete=False)
@@ -436,7 +543,7 @@ class ZappaCLI(object):
         prebuild_module_s, prebuild_function_s = self.prebuild_script.rsplit('.', 1)
 
         # The module
-        prebuild_module = importlib.import_module(prebuild_module_s)
+        prebuild_module = imp.load_source(prebuild_module_s, prebuild_module_s + '.py')
 
         # The function
         prebuild_function = getattr(prebuild_module, prebuild_function_s)
